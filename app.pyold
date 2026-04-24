@@ -1,0 +1,1057 @@
+import os
+import uuid
+import json
+import asyncio
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from typing import Dict, List
+
+from fastapi import FastAPI, HTTPException, Depends, Request, Form
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from config import settings
+from database import engine, get_db, Base, ChatSession, Message, Project
+from handlers.chat import analyze_project_plan, generate_file_code, extract_code_from_response
+from handlers.github import push_to_github
+from middleware import setup_middleware
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ============ LIFESPAN ============
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application startup and shutdown"""
+    print("=" * 60)
+    print("🚀 AI Code Manager Studio Pro v2.0")
+    print("=" * 60)
+
+    # Create database tables
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    print("✅ Database tables created/verified")
+
+    # Check API keys
+    if settings.DEEPSEEK_API_KEY and "your_key" not in settings.DEEPSEEK_API_KEY:
+        print("🤖 DeepSeek AI: Connected")
+    else:
+        print("⚠️  DeepSeek API key not configured")
+
+    if settings.GITHUB_TOKEN and "your_token" not in settings.GITHUB_TOKEN:
+        print("📦 GitHub: Connected")
+    else:
+        print("⚠️  GitHub token not configured")
+
+    # Get Replit URL
+    slug = os.environ.get('REPL_SLUG', 'app')
+    owner = os.environ.get('REPL_OWNER', 'user')
+    print(f"🌐 URL: https://{slug}.{owner}.repl.co")
+    print("=" * 60)
+    print("🎉 App is ready!")
+
+    yield
+
+    print("🛑 Shutting down...")
+    await engine.dispose()
+
+
+# ============ FASTAPI APP ============
+app = FastAPI(
+    title="AI Code Manager Studio Pro",
+    description="AI-powered code generation with live tracking and GitHub integration",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Middleware
+setup_middleware(app)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static files
+os.makedirs("static", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Templates
+templates = Jinja2Templates(directory="templates")
+
+
+# ============ GLOBAL ERROR HANDLER ============
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch all unhandled exceptions"""
+    import traceback
+    error_detail = f"{type(exc).__name__}: {str(exc)}"
+    logger.error(f"🔥 Global Error: {error_detail}")
+    logger.error(f"📍 Path: {request.url.path}")
+    logger.error(f"📍 Method: {request.method}")
+    logger.error(traceback.format_exc())
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": error_detail,
+            "path": str(request.url.path),
+            "type": type(exc).__name__
+        }
+    )
+
+
+# ============ MAIN PAGE ============
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Main dashboard page"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Code Manager Studio Pro</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: linear-gradient(135deg, #0c0c1d 0%, #1a1a3e 50%, #0d0d2b 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            padding: 30px;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.1), rgba(118, 75, 162, 0.1));
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 36px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #888;
+            font-size: 16px;
+        }
+
+        .step-indicator {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 15px;
+        }
+
+        .step {
+            text-align: center;
+            flex: 1;
+            position: relative;
+            opacity: 0.4;
+            transition: all 0.3s;
+        }
+
+        .step.active {
+            opacity: 1;
+        }
+
+        .step-number {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 10px;
+            font-weight: bold;
+        }
+
+        .step-title {
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .step-desc {
+            font-size: 12px;
+            color: #888;
+        }
+
+        .main-card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 30px;
+            margin-bottom: 20px;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        textarea, input {
+            flex: 1;
+            padding: 15px 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            color: white;
+            font-size: 16px;
+            resize: vertical;
+            font-family: inherit;
+        }
+
+        textarea:focus, input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 20px rgba(102, 126, 234, 0.2);
+        }
+
+        textarea {
+            min-height: 100px;
+        }
+
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #11998e, #38ef7d);
+            color: white;
+        }
+
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(56, 239, 125, 0.4);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #eb3349, #f45c43);
+            color: white;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        .plan-display {
+            background: rgba(102, 126, 234, 0.1);
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+            display: none;
+        }
+
+        .plan-file {
+            padding: 12px 15px;
+            margin: 8px 0;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .file-icon {
+            width: 35px;
+            height: 35px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+        }
+
+        .progress-container {
+            margin: 20px 0;
+            display: none;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            border-radius: 10px;
+            width: 0%;
+            transition: width 0.5s;
+        }
+
+        .file-progress-item {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 8px;
+            gap: 10px;
+        }
+
+        .file-progress-item.generating {
+            background: rgba(255, 193, 7, 0.1);
+            border-left: 3px solid #ffc107;
+        }
+
+        .file-progress-item.completed {
+            background: rgba(56, 239, 125, 0.1);
+            border-left: 3px solid #38ef7d;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255,255,255,0.2);
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .alert {
+            padding: 15px 20px;
+            border-radius: 12px;
+            margin: 15px 0;
+        }
+
+        .alert-success {
+            background: rgba(56, 239, 125, 0.1);
+            border: 1px solid #38ef7d;
+            color: #38ef7d;
+        }
+
+        .alert-error {
+            background: rgba(235, 51, 73, 0.1);
+            border: 1px solid #eb3349;
+            color: #eb3349;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🚀 AI Code Manager Studio Pro</h1>
+            <p>AI-Powered Code Generation with Live Progress Tracking</p>
+        </div>
+
+        <!-- Steps -->
+        <div class="step-indicator">
+            <div class="step active" id="step1">
+                <div class="step-number">1</div>
+                <div class="step-title">Describe</div>
+                <div class="step-desc">Tell AI what to build</div>
+            </div>
+            <div class="step" id="step2">
+                <div class="step-number">2</div>
+                <div class="step-title">Review Plan</div>
+                <div class="step-desc">AI shows file structure</div>
+            </div>
+            <div class="step" id="step3">
+                <div class="step-number">3</div>
+                <div class="step-title">Generate</div>
+                <div class="step-desc">Live code generation</div>
+            </div>
+            <div class="step" id="step4">
+                <div class="step-number">4</div>
+                <div class="step-title">Push</div>
+                <div class="step-desc">Name & GitHub deploy</div>
+            </div>
+        </div>
+
+        <!-- Step 1: Describe Project -->
+        <div class="main-card" id="section-describe">
+            <h2>💡 What do you want to build?</h2>
+            <p style="color: #888; margin: 10px 0;">Describe your project in detail. AI will create a complete plan with file structure.</p>
+
+            <textarea id="projectDescription" placeholder="Example: Build a REST API for a todo app with user authentication, database models, and CRUD operations..."></textarea>
+
+            <button class="btn btn-primary" onclick="analyzeProject()">
+                🔍 Analyze & Create Plan
+            </button>
+
+            <div id="analyzeLoading" class="hidden" style="text-align: center; padding: 20px;">
+                <div class="spinner" style="margin: 0 auto;"></div>
+                <p style="margin-top: 10px;">AI is analyzing your project...</p>
+            </div>
+        </div>
+
+        <!-- Step 2: Review Plan -->
+        <div class="main-card hidden" id="section-plan">
+            <h2>📋 Project Plan</h2>
+            <div id="planContent"></div>
+
+            <div style="display: flex; gap: 10px; margin-top: 20px;">
+                <button class="btn btn-success" onclick="confirmAndGenerate()">
+                    ✅ Confirm & Generate Code
+                </button>
+                <button class="btn btn-danger" onclick="resetApp()">
+                    ❌ Cancel
+                </button>
+            </div>
+        </div>
+
+        <!-- Step 3: Live Progress -->
+        <div class="main-card hidden" id="section-progress">
+            <h2>⚡ Live Code Generation</h2>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <p style="text-align: center;" id="progressText">0% Complete</p>
+            <div id="fileProgressList"></div>
+        </div>
+
+        <!-- Step 4: Push to GitHub -->
+        <div class="main-card hidden" id="section-push">
+            <h2>📤 Push to GitHub</h2>
+            <div class="alert alert-success" id="completionMessage"></div>
+
+            <input type="text" id="repoName" placeholder="Enter repository name (e.g., my-awesome-project)" style="margin: 15px 0;">
+
+            <button class="btn btn-primary" onclick="pushToGitHub()">
+                🚀 Push to GitHub
+            </button>
+
+            <div id="pushStatus" style="margin-top: 15px;"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentSessionId = null;
+        let currentPlan = null;
+
+        async function analyzeProject() {
+            const description = document.getElementById('projectDescription').value.trim();
+            if (!description) {
+                alert('Please describe your project first!');
+                return;
+            }
+
+            // Show loading
+            document.getElementById('analyzeLoading').classList.remove('hidden');
+
+            try {
+                const formData = new FormData();
+                formData.append('message', description);
+
+                const response = await fetch('/api/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to analyze');
+                }
+
+                const data = await response.json();
+                currentSessionId = data.session_id;
+                currentPlan = data.plan;
+
+                // Display plan
+                displayPlan(data.plan);
+
+                // Update steps
+                updateStep(2);
+
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                document.getElementById('analyzeLoading').classList.add('hidden');
+            }
+        }
+
+        function displayPlan(plan) {
+            let html = `<div style="margin: 15px 0;">
+                <strong>📌 Project Type:</strong> ${plan.project_type}<br>
+                <strong>📝 Description:</strong> ${plan.description}<br>
+                <strong>📁 Total Files:</strong> ${plan.total_files}<br>
+                <strong>⏱️ Estimated Time:</strong> ${plan.estimated_time}
+            </div>`;
+
+            html += '<h3 style="margin-top: 20px;">📂 Files to Create:</h3>';
+
+            plan.files.forEach((file, index) => {
+                html += `
+                    <div class="plan-file">
+                        <div class="file-icon">📄</div>
+                        <div>
+                            <strong>${file.name}</strong>
+                            <div style="color: #888; font-size: 14px;">${file.description}</div>
+                        </div>
+                        <span style="margin-left: auto; color: #667eea;">${file.language}</span>
+                    </div>
+                `;
+            });
+
+            document.getElementById('planContent').innerHTML = html;
+            document.getElementById('section-describe').classList.add('hidden');
+            document.getElementById('section-plan').classList.remove('hidden');
+        }
+
+        async function confirmAndGenerate() {
+            document.getElementById('section-plan').classList.add('hidden');
+            document.getElementById('section-progress').classList.remove('hidden');
+            updateStep(3);
+
+            const formData = new FormData();
+            formData.append('session_id', currentSessionId);
+
+            try {
+                const response = await fetch('/api/generate-code', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = JSON.parse(line.slice(6));
+                            handleProgress(data);
+                        }
+                    }
+                }
+
+            } catch (error) {
+                alert('Error generating code: ' + error.message);
+            }
+        }
+
+        function handleProgress(data) {
+            if (data.type === 'progress') {
+                updateProgress(data.percentage, `Generating ${data.filename}...`);
+                addFileProgress(data.filename, 'generating');
+            } else if (data.type === 'file_complete') {
+                updateProgress(data.percentage, `${data.filename} completed!`);
+                updateFileProgress(data.filename, 'completed');
+            } else if (data.type === 'complete') {
+                updateProgress(100, 'All files generated!');
+
+                // Show push section
+                setTimeout(() => {
+                    document.getElementById('section-progress').classList.add('hidden');
+                    document.getElementById('section-push').classList.remove('hidden');
+                    document.getElementById('completionMessage').innerHTML = 
+                        `✅ All ${data.files.length} files generated successfully! Now give a name and push to GitHub.`;
+                    updateStep(4);
+                }, 1000);
+            } else if (data.type === 'error') {
+                updateFileProgress(data.filename, 'error');
+            }
+        }
+
+        function updateProgress(percentage, text) {
+            document.getElementById('progressFill').style.width = percentage + '%';
+            document.getElementById('progressText').textContent = text;
+        }
+
+        function addFileProgress(filename, status) {
+            const div = document.getElementById('fileProgressList');
+            div.innerHTML += `
+                <div class="file-progress-item ${status}" id="file-${filename}">
+                    ${status === 'generating' ? '<div class="spinner"></div>' : '✅'}
+                    <span>${filename}</span>
+                </div>
+            `;
+        }
+
+        function updateFileProgress(filename, status) {
+            const element = document.getElementById('file-' + filename);
+            if (element) {
+                element.className = 'file-progress-item completed';
+                element.querySelector('.spinner')?.remove();
+                element.innerHTML = '✅ <span>' + filename + ' - Done!</span>';
+            }
+        }
+
+        async function pushToGitHub() {
+            const repoName = document.getElementById('repoName').value.trim();
+            if (!repoName) {
+                alert('Please enter a repository name!');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('session_id', currentSessionId);
+            formData.append('repo_name', repoName);
+
+            document.getElementById('pushStatus').innerHTML = 
+                '<div style="text-align: center;"><div class="spinner" style="margin: 0 auto;"></div><p>Pushing to GitHub...</p></div>';
+
+            try {
+                const response = await fetch('/api/push-to-github', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    document.getElementById('pushStatus').innerHTML = `
+                        <div class="alert alert-success">
+                            ✅ Successfully pushed to GitHub!<br>
+                            🔗 <a href="${data.repo_url}" target="_blank" style="color: #38ef7d;">${data.repo_url}</a>
+                        </div>
+                    `;
+                } else {
+                    throw new Error(data.detail || 'Push failed');
+                }
+
+            } catch (error) {
+                document.getElementById('pushStatus').innerHTML = `
+                    <div class="alert alert-error">
+                        ❌ Error: ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        function updateStep(stepNumber) {
+            for (let i = 1; i <= 4; i++) {
+                const step = document.getElementById('step' + i);
+                if (i <= stepNumber) {
+                    step.classList.add('active');
+                } else {
+                    step.classList.remove('active');
+                }
+            }
+        }
+
+        function resetApp() {
+            currentSessionId = null;
+            currentPlan = null;
+            document.getElementById('projectDescription').value = '';
+            document.getElementById('repoName').value = '';
+            document.getElementById('fileProgressList').innerHTML = '';
+            document.getElementById('progressFill').style.width = '0%';
+            document.getElementById('pushStatus').innerHTML = '';
+
+            document.getElementById('section-describe').classList.remove('hidden');
+            document.getElementById('section-plan').classList.add('hidden');
+            document.getElementById('section-progress').classList.add('hidden');
+            document.getElementById('section-push').classList.add('hidden');
+
+            updateStep(1);
+        }
+    </script>
+</body>
+</html>
+    """
+
+    try:
+        return templates.TemplateResponse("index.html", {"request": request})
+    except:
+        return HTMLResponse(content=html_content)
+
+
+# ============ HEALTH CHECK ============
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": "2.0.0"
+    }
+
+
+# ============ STEP 1: AI PLAN ============
+@app.post("/api/analyze")
+async def analyze_project(
+    message: str = Form(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Step 1: User describes project, AI returns file structure plan
+    """
+    try:
+        logger.info(f"📝 Analyzing project: {message[:50]}...")
+
+        # Get AI plan
+        plan = await analyze_project_plan(message)
+
+        # Create session
+        session = ChatSession(
+            id=str(uuid.uuid4()),
+            name=message[:50],
+            status="planning"
+        )
+        db.add(session)
+
+        # Save user message
+        user_msg = Message(
+            session_id=session.id,
+            role="user",
+            content=message
+        )
+        db.add(user_msg)
+
+        # Create plan display text
+        plan_text = f"📋 **Project Plan**\n\n"
+        plan_text += f"**Type:** {plan.get('project_type', 'Project')}\n"
+        plan_text += f"**Description:** {plan.get('description', message)}\n\n"
+        plan_text += f"**Files to create ({plan.get('total_files', 0)}):**\n\n"
+
+        for f in plan.get('files', []):
+            plan_text += f"• `{f['name']}` - {f.get('description', 'No description')}\n"
+
+        # Save AI plan message
+        plan_msg = Message(
+            session_id=session.id,
+            role="assistant",
+            content=plan_text,
+            files_plan=plan
+        )
+        db.add(plan_msg)
+        await db.commit()
+
+        logger.info(f"✅ Plan created for session: {session.id}")
+
+        return {
+            "session_id": session.id,
+            "plan": plan,
+            "message": "Plan ready! Confirm to start code generation."
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Analyze error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ STEP 2: GENERATE CODE WITH LIVE STREAMING ============
+@app.post("/api/generate-code")
+async def generate_code_stream(
+    session_id: str = Form(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Step 2: Generate each file with live SSE progress updates
+    """
+    logger.info(f"⚡ Starting code generation for session: {session_id}")
+
+    # Get plan message
+    result = await db.execute(
+        select(Message).where(
+            Message.session_id == session_id,
+            Message.files_plan.isnot(None)
+        )
+    )
+    plan_msg = result.scalar_one_or_none()
+
+    if not plan_msg:
+        raise HTTPException(status_code=404, detail="Plan not found. Run /api/analyze first")
+
+    plan = plan_msg.files_plan
+    files = plan.get('files', [])
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files in plan")
+
+    # Update session status
+    session_result = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+    session = session_result.scalar_one_or_none()
+    if session:
+        session.status = "generating"
+        await db.commit()
+
+    async def event_generator():
+        generated_files = {}
+
+        for i, file_info in enumerate(files):
+            filename = file_info['name']
+            percentage = int((i / len(files)) * 100)
+
+            # Send progress
+            progress_data = {
+                "type": "progress",
+                "current": i + 1,
+                "total": len(files),
+                "filename": filename,
+                "status": "generating",
+                "percentage": percentage
+            }
+            yield f"data: {json.dumps(progress_data)}\n\n"
+            await asyncio.sleep(0.1)
+
+            try:
+                # Generate code for this file
+                code = await generate_file_code(
+                    filename,
+                    file_info.get('description', ''),
+                    plan.get('description', '')
+                )
+
+                clean_code = extract_code_from_response(code)
+                generated_files[filename] = clean_code
+
+                # Send completion
+                complete_data = {
+                    "type": "file_complete",
+                    "filename": filename,
+                    "code_preview": clean_code[:200] + ('...' if len(clean_code) > 200 else ''),
+                    "status": "completed",
+                    "percentage": int(((i + 1) / len(files)) * 100)
+                }
+                yield f"data: {json.dumps(complete_data)}\n\n"
+
+            except Exception as e:
+                error_data = {
+                    "type": "error",
+                    "filename": filename,
+                    "error": str(e)
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+
+        # All files generated - save to database
+        all_code = "\n\n".join([
+            f"# {'='*40}\n# File: {name}\n# {'='*40}\n\n{code}" 
+            for name, code in generated_files.items()
+        ])
+
+        # Save code message
+        code_msg = Message(
+            session_id=session_id,
+            role="assistant",
+            content=f"✅ **All {len(generated_files)} files generated successfully!**\n\n" + 
+                    "\n".join([f"• `{name}`" for name in generated_files.keys()]),
+            code=all_code,
+            files_plan={"generated_files": list(generated_files.keys())}
+        )
+        db.add(code_msg)
+
+        # Create project
+        project = Project(
+            session_id=session_id,
+            name=session.name if session else "Untitled Project",
+            files=generated_files
+        )
+        db.add(project)
+
+        # Update session status
+        if session:
+            session.status = "completed"
+
+        await db.commit()
+
+        # Send final completion
+        final_data = {
+            "type": "complete",
+            "files": list(generated_files.keys()),
+            "project_id": project.id,
+            "session_id": session_id,
+            "message": "All files generated! Now you can name your project and push to GitHub."
+        }
+        yield f"data: {json.dumps(final_data)}\n\n"
+
+        logger.info(f"✅ Code generation complete for session: {session_id}")
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+# ============ STEP 3: PUSH TO GITHUB ============
+@app.post("/api/push-to-github")
+async def push_project_to_github(
+    session_id: str = Form(...),
+    repo_name: str = Form(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Step 3: Manual push - user gives name and clicks button
+    """
+    logger.info(f"📤 Pushing to GitHub: {repo_name}")
+
+    # Validate GitHub token
+    if not settings.GITHUB_TOKEN or "your_token" in settings.GITHUB_TOKEN:
+        raise HTTPException(
+            status_code=400, 
+            detail="GitHub token not configured. Add GITHUB_TOKEN to Replit Secrets."
+        )
+
+    # Get project
+    result = await db.execute(
+        select(Project).where(Project.session_id == session_id)
+    )
+    project = result.scalar_one_or_none()
+
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.files:
+        raise HTTPException(status_code=400, detail="No files to push")
+
+    try:
+        # Push to GitHub
+        repo_url = await push_to_github(
+            repo_name,
+            project.files,
+            settings.GITHUB_TOKEN
+        )
+
+        # Update records
+        project.name = repo_name
+        project.repo_url = repo_url
+        project.pushed = "yes"
+
+        # Update session
+        session_result = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        session = session_result.scalar_one_or_none()
+        if session:
+            session.status = "pushed"
+
+        await db.commit()
+
+        logger.info(f"✅ Pushed to GitHub: {repo_url}")
+
+        return {
+            "success": True,
+            "repo_url": repo_url,
+            "message": f"Successfully pushed to {repo_url}"
+        }
+
+    except Exception as e:
+        logger.error(f"❌ GitHub push error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ GET SESSION INFO ============
+@app.get("/api/session/{session_id}")
+async def get_session_info(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Get session status and details"""
+    session_result = await db.execute(select(ChatSession).where(ChatSession.id == session_id))
+    session = session_result.scalar_one_or_none()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Get project
+    project_result = await db.execute(select(Project).where(Project.session_id == session_id))
+    project = project_result.scalar_one_or_none()
+
+    return {
+        "session_id": session.id,
+        "name": session.name,
+        "status": session.status,
+        "created_at": session.created_at.isoformat(),
+        "project": {
+            "id": project.id if project else None,
+            "name": project.name if project else None,
+            "files": list(project.files.keys()) if project and project.files else [],
+            "pushed": project.pushed if project else "no",
+            "repo_url": project.repo_url if project else None
+        } if project else None
+    }
+
+
+# ============ LIST SESSIONS ============
+@app.get("/api/sessions")
+async def list_sessions(db: AsyncSession = Depends(get_db)):
+    """List all sessions"""
+    result = await db.execute(
+        select(ChatSession).order_by(ChatSession.created_at.desc())
+    )
+    sessions = result.scalars().all()
+
+    return [
+        {
+            "id": s.id,
+            "name": s.name,
+            "status": s.status,
+            "created_at": s.created_at.isoformat()
+        }
+        for s in sessions
+    ]
+
+
+# ============ RUN APP ============
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=False
+    )
