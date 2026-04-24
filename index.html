@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Code Manager Studio Pro</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div style="max-width: 800px; margin: 50px auto; padding: 20px;">
+        <h1>🚀 AI Code Manager Studio Pro</h1>
+
+        <!-- Step 1 -->
+        <div style="background: rgba(255,255,255,0.05); padding: 20px; border-radius: 10px; margin: 20px 0;">
+            <h2>Step 1: Describe Your Project</h2>
+            <textarea id="projectDescription" style="width: 100%; height: 100px; background: #1a1a2e; color: white; border: 1px solid #333; padding: 10px; border-radius: 5px;" placeholder="Describe what you want to build..."></textarea>
+            <button onclick="analyzeProject()" style="margin-top: 10px; padding: 10px 20px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer;">Analyze & Create Plan</button>
+        </div>
+
+        <!-- Plan Display -->
+        <div id="planSection" style="display: none; background: rgba(255,255,255,0.05); padding: 20px; border-radius: 10px; margin: 20px 0;">
+            <h2>Step 2: Review Plan</h2>
+            <div id="planContent"></div>
+            <button onclick="confirmAndGenerate()" style="margin-top: 10px; padding: 10px 20px; background: #38ef7d; color: white; border: none; border-radius: 5px; cursor: pointer;">Confirm & Generate</button>
+        </div>
+
+        <!-- Progress -->
+        <div id="progressSection" style="display: none; background: rgba(255,255,255,0.05); padding: 20px; border-radius: 10px; margin: 20px 0;">
+            <h2>Step 3: Generating Code...</h2>
+            <div id="progressBar" style="width: 100%; height: 10px; background: #333; border-radius: 5px;">
+                <div id="progressFill" style="width: 0%; height: 100%; background: #667eea; border-radius: 5px;"></div>
+            </div>
+            <div id="fileProgress" style="margin-top: 10px;"></div>
+        </div>
+
+        <!-- Push -->
+        <div id="pushSection" style="display: none; background: rgba(255,255,255,0.05); padding: 20px; border-radius: 10px; margin: 20px 0;">
+            <h2>Step 4: Push to GitHub</h2>
+            <input id="repoName" style="width: 100%; padding: 10px; background: #1a1a2e; color: white; border: 1px solid #333; border-radius: 5px;" placeholder="Repository name">
+            <button onclick="pushToGitHub()" style="margin-top: 10px; padding: 10px 20px; background: #f5576c; color: white; border: none; border-radius: 5px; cursor: pointer;">Push to GitHub</button>
+            <div id="pushStatus" style="margin-top: 10px;"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
